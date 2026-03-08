@@ -1,86 +1,51 @@
-name: Build TEE Bypass Kernel
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Workflow
-        uses: actions/checkout@v4
-
-      - name: Setup Build Environment
+- name: Inject Shadow Drivers & Apply Patches
         run: |
-          sudo apt-get update
-          # Added gcc-aarch64-linux-gnu to fix the 'not found' error
-          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3 gcc-aarch64-linux-gnu
-
-      - name: Clone Kernel Source
-        run: |
-          # Pulling the Evolution X sm8250 kernel source for the 9R
-          git clone --depth 1 https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250.git kernel_source
-          # Move everything to the root so the rest of the script works
-          mv kernel_source/* .
-          mv kernel_source/.* . 2>/dev/null || true
-
-      - name: Inject Shadow Drivers & Apply Patches
-        run: |
-          # 1. Verify Makefile existence
-          if [ ! -f "Makefile" ]; then
-            echo "❌ ERROR: Makefile not found in root after clone!"
-            ls -la
-            exit 1
-          fi
-
-          # 2. Inject TEE Bypass Shadow Drivers
+          # 1. Create the driver directory and build files
           mkdir -p drivers/shadow_drivers
-          cat <<EOF > drivers/shadow_drivers/Makefile
-          obj-y += tee_spy.o
-          EOF
-          cat <<EOF > drivers/shadow_drivers/Kbuild
-          obj-y += tee_spy.o
-          EOF
+          echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Makefile
+          echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Kbuild
 
-          # 3. Modify Root Makefile
-          sed -i '/core-y/ s/$/ shadow_drivers\//' Makefile
-
-          # 4. Kernel Patches for sm8250/Oplus
-          sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
+          # 2. VERY CAREFUL Root Makefile Injection
+          # Instead of appending, we replace the line to ensure parentheses remain balanced
+          # This avoids the 'unterminated call to function patsubst' error
+          sed -i 's/^drivers-y[[:space:]]*:=/drivers-y := shadow_drivers\/ /' Makefile
+          
+          # 3. Targeted C-Header Patches
+          # We use specific line starts to ensure we don't double-patch or corrupt files
+          
+          # Fix tee_shm.c: Add header only if not already there
+          grep -q "linux/types.h" drivers/tee/tee_shm.c || sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
+          
+          # Fix qseecom.c: Comment out the problematic intercept call
+          # We use a very specific match for the function name we saw in your logs
           sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
-          sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
+          
+          # Fix irq-gic-v3.c: Add Oplus profile header
+          grep -q "oplus_wakelock_profiler.h" drivers/irqchip/irq-gic-v3.c || sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
 
       - name: Build Kernel (OnePlus 9R)
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # Initialize the OnePlus 9R platform configuration
+          # Kona is the platform for the 9R
           make O=out vendor/kona-perf_defconfig
           
-          # Inject the module config and update silently
-          echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
+          # Use a safer method to append to .config
+          # We check if the config exists before appending to avoid duplicates
+          grep -q "CONFIG_EVO_TEE_SPY" out/.config || echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
+          
+          # Resolve dependencies silently
           make O=out olddefconfig
           
-          # Build using LLVM/Clang with bypass flags for vendor warnings
+          # Build with Clang and ignore vendor-specific warnings
           make -j$(nproc) O=out \
-            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
             KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-return-type -Wno-unused-variable" \
             2>&1 | tee build.log
-
-      - name: Package with AnyKernel3
-        run: |
-          git clone https://github.com/osm0sis/AnyKernel3.git
-          cp out/arch/arm64/boot/Image AnyKernel3/
-          cd AnyKernel3
-          # Configure for the 9R (lemonades)
-          sed -i 's/device.name1=maguro/device.name1=lemonades/g' anykernel.sh
-          zip -r ../Ok-TEE-Bypass-9R.zip ./*
-
-      - name: Upload Finished Kernel
-        uses: actions/upload-artifact@v4
-        with:
-          name: TEE-Bypass-Build
-          path: |
-            Ok-TEE-Bypass-9R.zip
-            build.log
