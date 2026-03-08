@@ -6,7 +6,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Source
+      - name: Checkout Workflow
         uses: actions/checkout@v4
 
       - name: Setup Build Environment
@@ -14,17 +14,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3
 
+      - name: Clone Kernel Source
+        run: |
+          # Pulling the Evolution X sm8250 kernel source for the 9R
+          git clone --depth 1 https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250.git kernel_source
+          # Move everything to the root so the rest of the script works
+          mv kernel_source/* .
+          mv kernel_source/.* . 2>/dev/null || true
+
       - name: Inject Shadow Drivers & Apply Patches
         run: |
-          # 1. Locate the Makefile to handle any sub-directory structures
-          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
-          if [ -z "$MAKEFILE_PATH" ]; then
-            echo "Error: Could not find kernel source Makefile!"
+          # 1. Verify Makefile existence
+          if [ ! -f "Makefile" ]; then
+            echo "❌ ERROR: Makefile not found in root after clone!"
+            ls -la
             exit 1
           fi
-          cd $(dirname "$MAKEFILE_PATH")
 
-          # 2. Create the shadow_drivers directory and makefiles
+          # 2. Inject TEE Bypass Shadow Drivers
           mkdir -p drivers/shadow_drivers
           cat <<EOF > drivers/shadow_drivers/Makefile
           obj-y += tee_spy.o
@@ -33,35 +40,29 @@ jobs:
           obj-y += tee_spy.o
           EOF
 
-          # 3. Inject into Root Makefile
-          # Adding to core-y ensures it is linked into the main kernel image
+          # 3. Modify Root Makefile
+          # Links the new directory into the core kernel build
           sed -i '/core-y/ s/$/ shadow_drivers\//' Makefile
 
-          # 4. Patching for OnePlus 9R and Evolution X compatibility
-          # Fixing missing headers and implicit function errors
+          # 4. Kernel Patches for sm8250/Oplus
+          # Fixing specific header and function declaration issues
           sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
           sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
           sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
 
       - name: Build Kernel (OnePlus 9R)
         run: |
-          # Ensure we are in the directory containing the Makefile
-          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
-          cd $(dirname "$MAKEFILE_PATH")
-
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # Initialize the base configuration
+          # Initialize the OnePlus 9R platform configuration
           make O=out vendor/kona-perf_defconfig
           
-          # Force the new driver config to 'y' to prevent the build from hanging
+          # Inject the module config and update silently
           echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
-          
-          # Automatically accept the new config changes silently
           make O=out olddefconfig
           
-          # Compile using Clang and LLVM with flags to ignore vendor-specific code errors
+          # Build using LLVM/Clang with bypass flags for vendor warnings
           make -j$(nproc) O=out \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
@@ -70,11 +71,10 @@ jobs:
 
       - name: Package with AnyKernel3
         run: |
-          # Package the built Image into a flashable zip for the OnePlus 9R
           git clone https://github.com/osm0sis/AnyKernel3.git
           cp out/arch/arm64/boot/Image AnyKernel3/
           cd AnyKernel3
-          # Set the device name to lemonades for the 9R
+          # Configure for the 9R (lemonades)
           sed -i 's/device.name1=maguro/device.name1=lemonades/g' anykernel.sh
           zip -r ../Ok-TEE-Bypass-9R.zip ./*
 
