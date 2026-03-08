@@ -12,73 +12,113 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          # Standard tools for OnePlus 9R kernel development
+          # Essential toolchain for OnePlus 9R (kona) development
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3 gcc-aarch64-linux-gnu
 
       - name: Clone Kernel Source
         run: |
-          # Cloning Evolution X sm8250 source for the 9R
+          # Cloning the Evolution X sm8250 source for the 9R
           git clone --depth 1 https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250.git kernel_source
           mv kernel_source/* .
           mv kernel_source/.* . 2>/dev/null || true
 
       - name: Inject Shadow Drivers & Apply Patches
         run: |
-          # 1. Create the shadow_drivers directory and required files
           mkdir -p drivers/shadow_drivers
+          
+          # 1. Inject tee_spy.h
+          cat <<EOF > drivers/shadow_drivers/tee_spy.h
+          #ifndef _TEE_SPY_H_
+          #define _TEE_SPY_H_
+          #include <linux/types.h>
+          void evo_spy_intercept(void *buf, size_t len);
+          void update_checksums(uint8_t *data, size_t len);
+          #endif
+          EOF
+
+          # 2. Inject tee_spy.c
+          cat <<EOF > drivers/shadow_drivers/tee_spy.c
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/crc32.h>
+          #include <linux/string.h>
+          #include "tee_spy.h"
+
+          #define TAG "[EvoMod-Spy] "
+
+          void update_checksums(uint8_t *data, size_t len) {
+              if (len < 4) return;
+              uint32_t old_crc, new_crc;
+              size_t data_len = len - 4;
+              memcpy(&old_crc, data + data_len, sizeof(uint32_t));
+              new_crc = crc32_le(0, data, data_len);
+              if (old_crc != new_crc) {
+                  memcpy(data + data_len, &new_crc, sizeof(uint32_t));
+                  pr_info(TAG "Integrity fixed! 0x%08X -> 0x%08X\n", old_crc, new_crc);
+              }
+          }
+
+          void evo_spy_intercept(void *buf, size_t len) {
+              uint8_t *data = (uint8_t *)buf;
+              bool patched = false;
+              if (!buf || len < 64) return;
+              for (int i = 0; i < len - 3; i++) {
+                  if (data[i] == 0x02 && data[i+1] == 0x01 && data[i+2] == 0x01) {
+                      data[i+2] = 0x00; 
+                      patched = true;
+                      pr_info(TAG "Bootloader status spoofed at offset 0x%X\n", i+2);
+                      break; 
+                  }
+              }
+              if (patched) {
+                  update_checksums(data, len);
+              }
+          }
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("Ok");
+          EOF
+
+          # 3. Create local Makefiles
           echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Makefile
           echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Kbuild
           
-          # 2. ULTRA-SAFE Root Makefile Injection
-          # We use a cleaner method to add the directory to the build core
-          # This avoids the 'unterminated call to function patsubst' error
+          # 4. Safe Root Makefile Injection
           sed -i 's/^drivers-y[[:space:]]*:=/drivers-y := drivers\/shadow_drivers\/ /' Makefile
 
-          # 3. Targeted C-Header & Logic Patches
-          # Fix tee_shm.c: Add missing types header
+          # 5. Targeted Patches
           grep -q "linux/types.h" drivers/tee/tee_shm.c || sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
           
-          # Fix qseecom.c: Bypass the intercept call causing errors on 9R
+          # Inject the header into qseecom.c so it knows about our function
+          sed -i '1i #include "../shadow_drivers/tee_spy.h"' drivers/misc/qseecom.c
+          
+          # Note: Commenting the call until you are ready to place the hook manually
           sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
           
-          # Fix irq-gic-v3.c: Add Oplus wakelock header
           grep -q "oplus_wakelock_profiler.h" drivers/irqchip/irq-gic-v3.c || sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
 
       - name: Build Kernel (OnePlus 9R)
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          
-          # 1. Initialize the Kona (OnePlus 9R) config
           make O=out vendor/kona-perf_defconfig
-          
-          # 2. Force enable the TEE Spy bypass driver
           echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
           make O=out olddefconfig
-          
-          # 3. Compile with Clang and ignore vendor code syntax warnings
           make -j$(nproc) O=out \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-return-type -Wno-unused-variable" \
             2>&1 | tee build.log
 
-      - name: Package with AnyKernel3
+      - name: Package & Upload
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git
-          # Robust search for the built Image to ensure packaging succeeds
           IMAGE_PATH=$(find out/arch/arm64/boot/ -name "Image" | head -n 1)
-          if [ -z "$IMAGE_PATH" ]; then
-            echo "❌ ERROR: Kernel Image not found!"
-            exit 1
-          fi
           cp "$IMAGE_PATH" AnyKernel3/
           cd AnyKernel3
-          # Configure for the OnePlus 9R (lemonades)
           sed -i 's/device.name1=maguro/device.name1=lemonades/g' anykernel.sh
           zip -r ../Ok-TEE-Bypass-9R.zip ./*
 
-      - name: Upload Finished Kernel
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TEE-Bypass-Build
