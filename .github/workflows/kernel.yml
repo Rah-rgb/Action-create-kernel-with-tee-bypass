@@ -12,12 +12,10 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          # Essential toolchain for OnePlus 9R (kona) development
           sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3 gcc-aarch64-linux-gnu
 
       - name: Clone Kernel Source
         run: |
-          # Cloning the Evolution X sm8250 source for the 9R
           git clone --depth 1 https://github.com/Evolution-X-Devices/kernel_oneplus_sm8250.git kernel_source
           mv kernel_source/* .
           mv kernel_source/.* . 2>/dev/null || true
@@ -26,7 +24,7 @@ jobs:
         run: |
           mkdir -p drivers/shadow_drivers
           
-          # 1. Inject tee_spy.h
+          # 1. Inject Updated tee_spy.h
           cat <<EOF > drivers/shadow_drivers/tee_spy.h
           #ifndef _TEE_SPY_H_
           #define _TEE_SPY_H_
@@ -36,16 +34,14 @@ jobs:
           #endif
           EOF
 
-          # 2. Inject tee_spy.c
+          # 2. Inject Precision tee_spy.c
           cat <<EOF > drivers/shadow_drivers/tee_spy.c
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/crc32.h>
           #include <linux/string.h>
           #include "tee_spy.h"
-
           #define TAG "[EvoMod-Spy] "
-
           void update_checksums(uint8_t *data, size_t len) {
               if (len < 4) return;
               uint32_t old_crc, new_crc;
@@ -57,7 +53,6 @@ jobs:
                   pr_info(TAG "Integrity fixed! 0x%08X -> 0x%08X\n", old_crc, new_crc);
               }
           }
-
           void evo_spy_intercept(void *buf, size_t len) {
               uint8_t *data = (uint8_t *)buf;
               bool patched = false;
@@ -66,34 +61,24 @@ jobs:
                   if (data[i] == 0x02 && data[i+1] == 0x01 && data[i+2] == 0x01) {
                       data[i+2] = 0x00; 
                       patched = true;
-                      pr_info(TAG "Bootloader status spoofed at offset 0x%X\n", i+2);
+                      pr_info(TAG "VerifiedBootState spoofed at offset 0x%X\n", i+2);
                       break; 
                   }
               }
-              if (patched) {
-                  update_checksums(data, len);
-              }
+              if (patched) update_checksums(data, len);
           }
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("Ok");
           EOF
 
-          # 3. Create local Makefiles
           echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Makefile
           echo "obj-y += tee_spy.o" > drivers/shadow_drivers/Kbuild
           
-          # 4. Safe Root Makefile Injection
+          # --- ULTRA-CAREFUL PATCHING ---
           sed -i 's/^drivers-y[[:space:]]*:=/drivers-y := drivers\/shadow_drivers\/ /' Makefile
-
-          # 5. Targeted Patches
+          grep -q "tee_spy.h" drivers/misc/qseecom.c || sed -i '1i #include "../shadow_drivers/tee_spy.h"' drivers/misc/qseecom.c
+          sed -i '/scm_call2(.*);/a \    if (ret == 0 && req->resp_buf) evo_spy_intercept(req->resp_buf, req->resp_len);' drivers/misc/qseecom.c
           grep -q "linux/types.h" drivers/tee/tee_shm.c || sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
-          
-          # Inject the header into qseecom.c so it knows about our function
-          sed -i '1i #include "../shadow_drivers/tee_spy.h"' drivers/misc/qseecom.c
-          
-          # Note: Commenting the call until you are ready to place the hook manually
-          sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
-          
           grep -q "oplus_wakelock_profiler.h" drivers/irqchip/irq-gic-v3.c || sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
 
       - name: Build Kernel (OnePlus 9R)
@@ -101,13 +86,9 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           make O=out vendor/kona-perf_defconfig
-          echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
+          grep -q "CONFIG_EVO_TEE_SPY=y" out/.config || echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
           make O=out olddefconfig
-          make -j$(nproc) O=out \
-            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-return-type -Wno-unused-variable" \
-            2>&1 | tee build.log
+          make -j$(nproc) O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-return-type -Wno-unused-variable" 2>&1 | tee build.log
 
       - name: Package & Upload
         run: |
