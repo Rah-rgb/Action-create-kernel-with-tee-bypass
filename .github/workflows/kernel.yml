@@ -1,12 +1,12 @@
 name: Build TEE Bypass Kernel
 on:
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Kernel Source
+      - name: Checkout Source
         uses: actions/checkout@v4
 
       - name: Setup Build Environment
@@ -16,54 +16,72 @@ jobs:
 
       - name: Inject Shadow Drivers & Apply Patches
         run: |
-          # Create directory for the TEE bypass logic
+          # 1. Locate the Makefile to handle any sub-directory structures
+          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
+          if [ -z "$MAKEFILE_PATH" ]; then
+            echo "Error: Could not find kernel source Makefile!"
+            exit 1
+          fi
+          cd $(dirname "$MAKEFILE_PATH")
+
+          # 2. Create the shadow_drivers directory and makefiles
           mkdir -p drivers/shadow_drivers
-          
-          # Root Makefile: Add to core-y so it links with the kernel core
-          sed -i '/core-y/ s/$/ shadow_drivers\//' Makefile
-          
-          # Create the local Makefile for shadow_drivers
           cat <<EOF > drivers/shadow_drivers/Makefile
           obj-y += tee_spy.o
           EOF
-
-          # Create the local Kbuild
           cat <<EOF > drivers/shadow_drivers/Kbuild
           obj-y += tee_spy.o
           EOF
 
-          # Patch tee_shm.c and qseecom.c to support the bypass logic
-          # Fixes implicit declarations and return-type errors
+          # 3. Inject into Root Makefile
+          # Adding to core-y ensures it is linked into the main kernel image
+          sed -i '/core-y/ s/$/ shadow_drivers\//' Makefile
+
+          # 4. Patching for OnePlus 9R and Evolution X compatibility
+          # Fixing missing headers and implicit function errors
           sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
           sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
           sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
 
       - name: Build Kernel (OnePlus 9R)
         run: |
+          # Ensure we are in the directory containing the Makefile
+          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" | head -n 1)
+          cd $(dirname "$MAKEFILE_PATH")
+
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # Initialize Config (Kona is the 865 platform for the 9R)
+          # Initialize the base configuration
           make O=out vendor/kona-perf_defconfig
           
-          # Compile with KCFLAGS to ignore vendor-specific warnings/errors
+          # Force the new driver config to 'y' to prevent the build from hanging
+          echo "CONFIG_EVO_TEE_SPY=y" >> out/.config
+          
+          # Automatically accept the new config changes silently
+          make O=out olddefconfig
+          
+          # Compile using Clang and LLVM with flags to ignore vendor-specific code errors
           make -j$(nproc) O=out \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-return-type -Wno-unused-variable" \
             2>&1 | tee build.log
 
-      - name: Create Flashable Zip (AnyKernel3)
+      - name: Package with AnyKernel3
         run: |
+          # Package the built Image into a flashable zip for the OnePlus 9R
           git clone https://github.com/osm0sis/AnyKernel3.git
           cp out/arch/arm64/boot/Image AnyKernel3/
           cd AnyKernel3
-          # Configure for OnePlus 9R (lemonades)
+          # Set the device name to lemonades for the 9R
           sed -i 's/device.name1=maguro/device.name1=lemonades/g' anykernel.sh
-          zip -r ../TEE-Bypass-Kernel-9R.zip ./*
+          zip -r ../Ok-TEE-Bypass-9R.zip ./*
 
       - name: Upload Finished Kernel
         uses: actions/upload-artifact@v4
         with:
           name: TEE-Bypass-Build
-          path: TEE-Bypass-Kernel-9R.zip
+          path: |
+            Ok-TEE-Bypass-9R.zip
+            build.log
