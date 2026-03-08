@@ -12,7 +12,8 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3
+          # Added gcc-aarch64-linux-gnu to fix the 'not found' error
+          sudo apt-get install -y bc build-essential flex bison libssl-dev libelf-dev clang lld llvm python3 gcc-aarch64-linux-gnu
 
       - name: Clone Kernel Source
         run: |
@@ -41,11 +42,9 @@ jobs:
           EOF
 
           # 3. Modify Root Makefile
-          # Links the new directory into the core kernel build
           sed -i '/core-y/ s/$/ shadow_drivers\//' Makefile
 
           # 4. Kernel Patches for sm8250/Oplus
-          # Fixing specific header and function declaration issues
           sed -i '1i #include <linux/types.h>' drivers/tee/tee_shm.c
           sed -i 's/evo_spy_intercept/\/\/ evo_spy_intercept/g' drivers/misc/qseecom.c
           sed -i '1i #include <soc/oplus/oplus_wakelock_profiler.h>' drivers/irqchip/irq-gic-v3.c
